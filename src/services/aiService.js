@@ -96,45 +96,56 @@ async function callGemini(base64Image, mimeType) {
   };
 
   const preferredModel = env.aiModel || "gemini-1.5-flash";
-  const modelCandidates = [...new Set([preferredModel, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"])];
-  const apiVersions = ["v1beta", "v1"];
+  const endpointCandidates = [
+    // v1beta supports broader preview model naming.
+    { version: "v1beta", model: preferredModel },
+    { version: "v1beta", model: "gemini-1.5-flash" },
+    { version: "v1beta", model: "gemini-2.0-flash" },
+    { version: "v1beta", model: "gemini-1.5-flash-latest" },
+    // v1 is stricter; avoid -latest aliases that commonly 404.
+    { version: "v1", model: preferredModel },
+    { version: "v1", model: "gemini-1.5-flash" },
+    { version: "v1", model: "gemini-2.0-flash" },
+  ];
+  const uniqueEndpoints = endpointCandidates.filter(
+    (item, index, arr) =>
+      arr.findIndex((x) => x.version === item.version && x.model === item.model) ===
+      index,
+  );
   let response = null;
   let lastError = null;
   const max429Retries = 3;
 
-  for (const version of apiVersions) {
-    for (const model of modelCandidates) {
-      const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${env.geminiApiKey}`;
-      for (let attempt = 0; attempt <= max429Retries; attempt += 1) {
-        try {
-          response = await axios.post(url, requestBody, { timeout: 45000 });
-          lastError = null;
-          break;
-        } catch (error) {
-          const status = error?.response?.status;
-          lastError = error;
+  for (const candidate of uniqueEndpoints) {
+    const url = `https://generativelanguage.googleapis.com/${candidate.version}/models/${candidate.model}:generateContent?key=${env.geminiApiKey}`;
+    for (let attempt = 0; attempt <= max429Retries; attempt += 1) {
+      try {
+        response = await axios.post(url, requestBody, { timeout: 45000 });
+        lastError = null;
+        break;
+      } catch (error) {
+        const status = error?.response?.status;
+        lastError = error;
 
-          // Retry rate-limit errors with exponential backoff.
-          if (status === 429 && attempt < max429Retries) {
-            const waitMs = 1000 * (2 ** attempt);
-            await sleep(waitMs);
-            continue;
-          }
-
-          // Try next model/version when endpoint or model is unavailable.
-          if (status === 404) {
-            break;
-          }
-
-          // For a 429 after retries, try fallback model/version.
-          if (status === 429) {
-            break;
-          }
-
-          throw error;
+        // Retry rate-limit errors with exponential backoff.
+        if (status === 429 && attempt < max429Retries) {
+          const waitMs = 1000 * (2 ** attempt);
+          await sleep(waitMs);
+          continue;
         }
+
+        // Try next model/version when endpoint or model is unavailable.
+        if (status === 404) {
+          break;
+        }
+
+        // For a 429 after retries, try fallback model/version.
+        if (status === 429) {
+          break;
+        }
+
+        throw error;
       }
-      if (response) break;
     }
     if (response) break;
   }
@@ -163,77 +174,54 @@ async function callGemini(base64Image, mimeType) {
 
 async function parseInvoiceWithAi({ base64Image, mimeType = "image/jpeg" }) {
   const provider = (env.aiProvider || "openai").toLowerCase();
-  let parsed = null;
   const getProviderErrorMessage = (error, fallbackMessage) =>
     error?.response?.data?.error?.message ||
     error?.response?.data?.message ||
     error?.message ||
     fallbackMessage;
+  const callMap = {
+    openai: callOpenAI,
+    gemini: callGemini,
+  };
+  const fallbackOrderByProvider = {
+    openai: ["openai", "gemini"],
+    gemini: ["gemini", "openai"],
+  };
+  const providerOrder =
+    fallbackOrderByProvider[provider] || fallbackOrderByProvider.openai;
+  const availableProviders = providerOrder.filter((name) => {
+    if (name === "openai") return Boolean(env.openAiApiKey);
+    return Boolean(env.geminiApiKey);
+  });
 
-  if (provider === "gemini") {
+  if (!availableProviders.length) {
+    throw new ApiError(
+      500,
+      "No AI provider key configured (OPENAI_API_KEY / GEMINI_API_KEY)",
+    );
+  }
+
+  const errors = [];
+  let parsed = null;
+
+  for (const candidate of availableProviders) {
     try {
-      parsed = await callGemini(base64Image, mimeType);
+      console.log(`[OCR] Trying provider: ${candidate}`);
+      parsed = await callMap[candidate](base64Image, mimeType);
+      console.log(`[OCR] Provider success: ${candidate}`);
+      break;
     } catch (error) {
-      const status = error?.statusCode || error?.response?.status;
-      const geminiMessage = getProviderErrorMessage(error, "Gemini request failed");
-      const shouldFallbackToOpenAi =
-        Boolean(env.openAiApiKey) &&
-        [400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(
-          Number(status),
-        );
-
-      if (shouldFallbackToOpenAi) {
-        try {
-          parsed = await callOpenAI(base64Image, mimeType);
-        } catch (fallbackError) {
-          const openAiMessage = getProviderErrorMessage(
-            fallbackError,
-            "OpenAI fallback request failed",
-          );
-          throw new ApiError(
-            502,
-            `Gemini failed: ${geminiMessage}. OpenAI fallback failed: ${openAiMessage}`,
-          );
-        }
-      } else {
-        throw new ApiError(
-          Number(status) || 502,
-          `Gemini failed: ${geminiMessage}`,
-        );
-      }
+      const message = getProviderErrorMessage(
+        error,
+        `${candidate} request failed`,
+      );
+      console.warn(`[OCR] Provider failed: ${candidate} -> ${message}`);
+      errors.push(`${candidate.toUpperCase()} failed: ${message}`);
     }
-  } else {
-    try {
-      parsed = await callOpenAI(base64Image, mimeType);
-    } catch (error) {
-      const status = error?.statusCode || error?.response?.status;
-      const openAiMessage = getProviderErrorMessage(error, "OpenAI request failed");
-      const shouldFallbackToGemini =
-        Boolean(env.geminiApiKey) &&
-        [400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504].includes(
-          Number(status),
-        );
+  }
 
-      if (shouldFallbackToGemini) {
-        try {
-          parsed = await callGemini(base64Image, mimeType);
-        } catch (fallbackError) {
-          const geminiMessage = getProviderErrorMessage(
-            fallbackError,
-            "Gemini fallback request failed",
-          );
-          throw new ApiError(
-            502,
-            `OpenAI failed: ${openAiMessage}. Gemini fallback failed: ${geminiMessage}`,
-          );
-        }
-      } else {
-        throw new ApiError(
-          Number(status) || 502,
-          `OpenAI failed: ${openAiMessage}`,
-        );
-      }
-    }
+  if (!parsed) {
+    throw new ApiError(502, errors.join(". "));
   }
 
   if (!parsed || typeof parsed !== "object") {
